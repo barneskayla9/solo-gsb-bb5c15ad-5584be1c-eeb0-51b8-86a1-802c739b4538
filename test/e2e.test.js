@@ -190,6 +190,23 @@ async function main() {
   assert.strictEqual(p5.status, 201);
   const ad5 = await req('POST', `/api/proposals/${p5.json.id}/adopt`, {}, rev);
   assert.strictEqual(ad5.status, 200);
+
+  // 新规则：暂存修订触及异议，未回应时发布被拒绝；核对清单可见待回应项
+  const gateBefore = (await req('GET', '/api/publish-checks', null, rev)).json;
+  ok(gateBefore.canPublish === false && gateBefore.affectedCount === 1
+    && gateBefore.blockers[0].objectionId === oid
+    && gateBefore.blockers[0].reasonCode === 'MISSING_RESPONSE',
+    '发布核对：触及的异议列入待回应，canPublish=false');
+  const pubBlocked = await req('POST', '/api/publish', { note: '第二次修订' }, rev);
+  ok(pubBlocked.status === 409 && pubBlocked.json.code === 'OBJECTION_RESPONSES_REQUIRED'
+    && Array.isArray(pubBlocked.json.details) && pubBlocked.json.details.length === 1
+    && pubBlocked.json.details[0].objectionId === oid,
+    '未回应触及异议：发布 409 拒绝并附逐条明细，状态不改变');
+
+  // 复核员逐条回应（非空说明，关联异议、相关采纳提议、版本与暂存状态）后发布
+  const rs1 = await req('POST', `/api/objections/${oid}/respond`,
+    { note: '经复核录音 00:34:10，原引日期确需改为3月上旬，保留异议原文快照继续跟踪' }, rev);
+  ok(rs1.status === 201 && rs1.json.id >= 1, `复核员对异议 #${oid} 保存发布前回应`);
   await req('POST', '/api/publish', { note: '第二次修订' }, rev);
 
   booth = (await req('GET', '/api/booth', null, par)).json;
@@ -338,6 +355,12 @@ async function main() {
     { seg: 2, start: iShang, end: iShang + 4, replacement: '3月初', basis: '录音仅可辨认到月初' }, rec);
   assert.strictEqual(p12.status, 201);
   await req('POST', `/api/proposals/${p12.json.id}/adopt`, {}, rev);
+  // 异议已重定位到“3月上旬”，p12 触及该锚点：发布前须再次回应
+  let gb = (await req('GET', '/api/publish-checks', null, rev)).json;
+  ok(gb.canPublish === false && gb.blockers.some((b) => b.objectionId === oid),
+    '重定位后的异议再次被暂存修订触及，仍须回应');
+  const rs8 = await req('POST', `/api/objections/${oid}/respond`, { note: '重定位后的引用再次被修订触及，复核确认保留' }, rev);
+  ok(rs8.status === 201, '对重定位后异议的回应保存成功');
   await req('POST', '/api/publish', { note: '无关修订' }, rev);
   booth = (await req('GET', '/api/booth', null, rec)).json;
   ok(booth.currentVersion.id === 8, '发布 v8（第5段未被改动）');
@@ -395,6 +418,11 @@ async function main() {
 
   // 预览后版本变化：采纳 N13 并发布 v10，再用旧凭证确认 → 拒绝
   await req('POST', `/api/proposals/${cf13.json.id}/adopt`, {}, rev);
+  // N13（3月初→3月上旬）再次触及已重定位到“3月初”的异议锚点：发布前须回应
+  gb = (await req('GET', '/api/publish-checks', null, rev)).json;
+  ok(gb.affectedCount >= 1 && gb.blockers.some((b) => b.objectionId === oid && b.reasonCode === 'MISSING_RESPONSE'),
+    'v10 发布前核对：N13 触及异议，列入待回应');
+  await req('POST', `/api/objections/${oid}/respond`, { note: '采纳恢复为3月上旬的修订，经比对录音确认，异议继续保留' }, rev);
   await req('POST', '/api/publish', { note: '续提再发布' }, rev);
   booth = (await req('GET', '/api/booth', null, rec)).json;
   ok(booth.currentVersion.id === 10, '发布 v10');
@@ -405,6 +433,215 @@ async function main() {
   const v10view = (await req('GET', '/api/versions/10', null, par)).json;
   ok(v10view.decisions.some((d) => d.type === 'rebase' && d.proposal_id === cf13.json.id),
     '版本决议视图含续提留痕，可追溯');
+
+  console.log('\n[发布前异议回应：权限、非空说明与未回应阻止发布]');
+  const cur = async (ck) => (await req('GET', '/api/booth', null, ck)).json;
+  let B = await cur(rec);
+  ok(B.currentVersion.id === 10, '当前为 v10，进入本轮新流程');
+  const v10seg4 = B.segments.find((s) => s.seg === 4).text;
+  const iW2 = cpIndexOf(v10seg4, '王武');
+  // O2：active 异议，锚定第4段“王武”
+  const o2r = await req('POST', '/api/objections', { seg: 4, start: iW2, end: iW2 + 2, note: '王武身份仍需核验' }, par);
+  assert.strictEqual(o2r.status, 201);
+  const o2 = o2r.json.id;
+  // O3：第5段异议（用于“未被触及不能回应”与无受影响异议发布）
+  let seg5now = B.segments.find((s) => s.seg === 5).text;
+  const iJi = cpIndexOf(seg5now, '记录员');
+  const o3r = await req('POST', '/api/objections', { seg: 5, start: iJi, end: iJi + 3, note: '记录员称谓待核' }, par);
+  const oF3 = o3r.json.id;
+  // PA1 触及 O2
+  const pa1 = await req('POST', '/api/proposals',
+    { seg: 4, start: iW2, end: iW2 + 2, replacement: '王武（已核对）', basis: '庭后核验身份' }, rec);
+  assert.strictEqual(pa1.status, 201);
+  await req('POST', `/api/proposals/${pa1.json.id}/adopt`, {}, rev);
+
+  await expectFail(req('GET', '/api/publish-checks', null, par), 403, '无权操作', '参与者查询发布核对');
+  await expectFail(req('POST', `/api/objections/${o2}/respond`, { note: 'x' }, par), 403, '无权操作', '参与者尝试回应异议');
+  await expectFail(req('POST', `/api/objections/${o2}/respond`, { note: 'x' }, rec), 403, '无权操作', '记录员尝试回应异议');
+  await expectFail(req('POST', `/api/objections/${o2}/respond`, { note: '   ' }, rev), 400, '回应说明不能为空', '空回应说明');
+  await expectFail(req('POST', `/api/objections/${oF3}/respond`, { note: 'x' }, rev), 409, '未被当前暂存修订触及', '回应未被触及的异议');
+  await expectFail(req('POST', '/api/objections/9999/respond', { note: 'x' }, rev), 404, '不存在', '回应不存在的异议');
+
+  let gate = (await req('GET', '/api/publish-checks', null, rev)).json;
+  ok(gate.affectedCount === 1 && gate.canPublish === false
+    && gate.items.length === 1 && gate.items[0].objectionId === o2
+    && gate.items[0].missing === true
+    && JSON.stringify(gate.items[0].proposalIds) === JSON.stringify([pa1.json.id]),
+    '发布核对：1 项受影响异议待回应，关联相关采纳提议');
+  await expectFail(req('POST', '/api/publish', { note: '回应缺失' }, rev), 409, '缺少有效回应', '未回应发布被拒绝');
+  B = await cur(rev);
+  ok(B.currentVersion.id === 10 && B.stage.some((p) => p.id === pa1.json.id),
+    '发布被拒：版本不变、已采纳提议仍在暂存区');
+
+  const rsA = await req('POST', `/api/objections/${o2}/respond`,
+    { note: '经核验身份证，王武姓名无误，补充称谓不影响引用，异议留档' }, rev);
+  ok(rsA.status === 201, '首次回应返回 201');
+  const rsA2 = await req('POST', `/api/objections/${o2}/respond`,
+    { note: '复核更新：再次确认，修订保留，异议原文快照留存' }, rev);
+  ok(rsA2.status === 200 && rsA2.json.updated === true, '同一周期重复回应为覆盖更新（200）');
+  gate = (await req('GET', '/api/publish-checks', null, rev)).json;
+  ok(gate.canPublish === true && gate.items[0].valid === true && gate.items[0].note.includes('复核更新'),
+    '回应齐备：canPublish=true，回应绑定当前版本与暂存状态');
+  const pub11 = await req('POST', '/api/publish', { note: '回应后发布' }, rev);
+  ok(pub11.status === 201 && pub11.json.versionId === 11, '发布 v11 成功');
+
+  const v11 = (await req('GET', '/api/versions/11', null, par)).json;
+  ok(v11.responses.length === 1
+    && v11.responses[0].objectionId === o2
+    && JSON.stringify(v11.responses[0].proposalIds) === JSON.stringify([pa1.json.id])
+    && v11.responses[0].baseVersionId === 10
+    && v11.responses[0].note.includes('复核更新'),
+    '历史版本 v11 只读展示冻结回应（关联异议/提议/回应时版本/说明）');
+  const o2v11 = v11.objections.find((x) => x.id === o2);
+  ok(o2v11.status === 'needs_relocation' && o2v11.quoted_text === '王武',
+    '触及发布后异议仍按既有规则待重定位，原文快照保留');
+  B = await cur(par);
+  const o2now = B.objections.find((x) => x.id === o2);
+  ok(o2now.anchor_status === 'needs_relocation', '当前异议状态为待重新定位');
+  ok(B.publishChecks.affectedCount === 0 && B.publishChecks.items.length === 0,
+    '发布后待回应项清空，回应草稿已冻结不再出现');
+
+  console.log('\n[无受影响异议：按原规则发布]');
+  // 暂存第1段修订（第1段无异议锚点）→ 受影响集合为空，可直接发布
+  let seg1B = B.segments.find((s) => s.seg === 1).text;
+  const iDu = cpIndexOf(seg1B, '宣读纪律');
+  const pa2 = await req('POST', '/api/proposals',
+    { seg: 1, start: iDu, end: iDu + 4, replacement: '宣读法庭纪律', basis: '规范用语' }, rec);
+  await req('POST', `/api/proposals/${pa2.json.id}/adopt`, {}, rev);
+  gate = (await req('GET', '/api/publish-checks', null, rev)).json;
+  ok(gate.affectedCount === 0 && gate.canPublish === true, '无受影响异议：canPublish=true');
+  const pub12 = await req('POST', '/api/publish', { note: '无关段落修订' }, rev);
+  ok(pub12.status === 201 && pub12.json.versionId === 12, '无受影响异议时正常发布 v12');
+  const v12 = (await req('GET', '/api/versions/12', null, par)).json;
+  ok(v12.responses.length === 0, 'v12 无冻结回应');
+
+  console.log('\n[采纳/驳回提议后回应失效：重新核对并回应]');
+  // O4 锚定第3段“通知日期”；两项互不重叠且都触及锚点的修订
+  let seg3now = (await cur(rec)).segments.find((s) => s.seg === 3).text;
+  const a = cpIndexOf(seg3now, '通知日期');
+  const o4r = await req('POST', '/api/objections', { seg: 3, start: a, end: a + 4, note: '日期措辞异议' }, par);
+  const o4 = o4r.json.id;
+  const pb1 = await req('POST', '/api/proposals',
+    { seg: 3, start: a, end: a + 2, replacement: '通告', basis: '口误' }, rec);
+  const pb2 = await req('POST', '/api/proposals',
+    { seg: 3, start: a + 2, end: a + 4, replacement: '日子', basis: '口语化' }, rec);
+  await req('POST', `/api/proposals/${pb1.json.id}/adopt`, {}, rev);
+  await req('POST', `/api/proposals/${pb2.json.id}/adopt`, {}, rev);
+  let rsB = await req('POST', `/api/objections/${o4}/respond`,
+    { note: '两项修订均经复核，异议留档' }, rev);
+  ok(rsB.status === 201, '回应关联两项采纳提议');
+  // 驳回 pb2：相关采纳提议集合变化，原回应失效
+  await req('POST', `/api/proposals/${pb2.json.id}/reject`, { reason: '维持规范用语' }, rev);
+  gate = (await req('GET', '/api/publish-checks', null, rev)).json;
+  const bad = gate.blockers.find((x) => x.objectionId === o4);
+  ok(gate.canPublish === false && bad && bad.responseId && bad.reasonCode === 'STAGE_CHANGED',
+    '驳回提议后回应失效：STAGE_CHANGED 阻止发布');
+  await expectFail(req('POST', '/api/publish', { note: '失效回应' }, rev), 409, '缺少有效回应', '失效回应发布被拒绝');
+  B = await cur(rev);
+  ok(B.currentVersion.id === 12 && B.stage.some((p) => p.id === pb1.json.id),
+    '拒绝发布后版本仍为 v12，pb1 仍采纳（提议与决议不改变）');
+  const rsB2 = await req('POST', `/api/objections/${o4}/respond`,
+    { note: '重新核对：仅保留通告一项修订，异议留档' }, rev);
+  ok(rsB2.status === 200, '按当前暂存区重新回应成功');
+  await req('POST', '/api/publish', { note: '部分采纳' }, rev);
+  const v13 = (await req('GET', '/api/versions/13', null, par)).json;
+  ok(v13.id === 13 && JSON.stringify(v13.responses[0].proposalIds) === JSON.stringify([pb1.json.id]),
+    'v13 冻结回应只关联最终采纳的 pb1');
+
+  console.log('\n[重新定位异议后回应失效]');
+  // v13 后 O4 待重定位：先重定位到“日期”，再用触及新锚点的修订发布 v14
+  seg3now = (await cur(rec)).segments.find((s) => s.seg === 3).text;
+  const x1 = cpIndexOf(seg3now, '日期');
+  await req('POST', `/api/objections/${o4}/relocate`, { seg: 3, start: x1, end: x1 + 2 }, par);
+  const pc1 = await req('POST', '/api/proposals',
+    { seg: 3, start: x1, end: x1 + 2, replacement: '时间', basis: '用语统一' }, rec);
+  await req('POST', `/api/proposals/${pc1.json.id}/adopt`, {}, rev);
+  let rsC = await req('POST', `/api/objections/${o4}/respond`, { note: '重定位锚点被触及，复核确认' }, rev);
+  ok(rsC.status === 201, '对重定位后锚点的回应成功');
+  await req('POST', '/api/publish', { note: '重定位后修订' }, rev);
+  ok((await cur(par)).currentVersion.id === 14, '发布 v14，O4 再次待重定位');
+
+  // v14：在待重定位状态下回应，随后把异议重新定位到更小范围 → 回应失效
+  seg3now = (await cur(rec)).segments.find((s) => s.seg === 3).text;
+  const x2 = cpIndexOf(seg3now, '时间');
+  const pc2 = await req('POST', '/api/proposals',
+    { seg: 3, start: x2, end: x2 + 2, replacement: '时限', basis: '法言法语' }, rec);
+  await req('POST', `/api/proposals/${pc2.json.id}/adopt`, {}, rev);
+  rsC = await req('POST', `/api/objections/${o4}/respond`, { note: '待重定位期间先行回应' }, rev);
+  ok(rsC.status === 201, '待重定位异议仍可回应（按当前锚点触及判定）');
+  await req('POST', `/api/objections/${o4}/relocate`, { seg: 3, start: x2, end: x2 + 1 }, par);
+  gate = (await req('GET', '/api/publish-checks', null, rev)).json;
+  const reloBad = gate.blockers.find((y) => y.objectionId === o4);
+  ok(reloBad && reloBad.reasonCode === 'OBJECTION_RELOCATED', '回应后异议被重新定位：回应失效');
+  await expectFail(req('POST', '/api/publish', { note: '重定位使回应失效' }, rev), 409, '缺少有效回应', '重定位后失效回应阻止发布');
+  const rsC2 = await req('POST', `/api/objections/${o4}/respond`, { note: '按重新定位后的锚点重新回应' }, rev);
+  ok(rsC2.status === 200, '重新回应成功');
+  await req('POST', '/api/publish', { note: '再次重定位后发布' }, rev);
+  ok((await cur(par)).currentVersion.id === 15, '发布 v15');
+
+  console.log('\n[回应草稿随暂存变化成为孤儿：不阻止发布，成功发布后丢弃]');
+  B = await cur(rec);
+  seg5now = B.segments.find((s) => s.seg === 5).text;
+  const iH = cpIndexOf(seg5now, '核对录音');
+  const o5r = await req('POST', '/api/objections', { seg: 5, start: iH, end: iH + 4, note: '核对过程异议' }, par);
+  const o5 = o5r.json.id;
+  const pd1 = await req('POST', '/api/proposals',
+    { seg: 5, start: iH, end: iH + 2, replacement: '复核', basis: '笔误' }, rec);
+  await req('POST', `/api/proposals/${pd1.json.id}/adopt`, {}, rev);
+  await req('POST', `/api/objections/${o5}/respond`, { note: '先回应，随后驳回该修订' }, rev);
+  await req('POST', `/api/proposals/${pd1.json.id}/reject`, { reason: '不必修改' }, rev);
+  gate = (await req('GET', '/api/publish-checks', null, rev)).json;
+  ok(gate.affectedCount === 0 && gate.canPublish === true
+    && gate.orphanResponses.length === 1 && gate.orphanResponses[0].objectionId === o5
+    && gate.orphanResponses[0].reasonCode === 'NOT_TOUCHED_ANYMORE',
+    '孤儿回应草稿：列入失效项但不阻止发布');
+  // 另一项不触及任何异议的暂存修订
+  const seg1C = (await cur(rec)).segments.find((s) => s.seg === 1).text;
+  const iP = cpIndexOf(seg1C, '第一页');
+  const pe1 = await req('POST', '/api/proposals',
+    { seg: 1, start: iP, end: iP + 3, replacement: '第1页', basis: '阿拉伯数字' }, rec);
+  await req('POST', `/api/proposals/${pe1.json.id}/adopt`, {}, rev);
+  const pub16 = await req('POST', '/api/publish', { note: '孤儿草稿周期' }, rev);
+  ok(pub16.status === 201 && pub16.json.versionId === 16, '存在孤儿草稿时仍可发布 v16');
+  const v16 = (await req('GET', '/api/versions/16', null, par)).json;
+  ok(v16.responses.length === 0, 'v16 不冻结孤儿草稿');
+  B = await cur(par);
+  ok(B.objections.find((x) => x.id === o5).anchor_status === 'active'
+    && B.publishChecks.orphanResponses.length === 0,
+    '发布后孤儿草稿已丢弃，异议本身保持有效');
+
+  console.log('\n[零长度修订的插入点：落在引用范围内算触及，边界相接不算]');
+  seg5now = (await cur(rec)).segments.find((s) => s.seg === 5).text;
+  const iC = cpIndexOf(seg5now, '确认第3段');
+  const o6r = await req('POST', '/api/objections',
+    { seg: 5, start: iC, end: iC + 5, note: '插入点触及判定' }, par);
+  const o6 = o6r.json.id;
+  const pIns = await req('POST', '/api/proposals',
+    { seg: 5, start: iC + 2, end: iC + 2, replacement: '【插入】', basis: '补记' }, rec);
+  const pEdge = await req('POST', '/api/proposals',
+    { seg: 5, start: iC + 5, end: iC + 5, replacement: '【边界】', basis: '补记' }, rec);
+  await req('POST', `/api/proposals/${pIns.json.id}/adopt`, {}, rev);
+  await req('POST', `/api/proposals/${pEdge.json.id}/adopt`, {}, rev);
+  gate = (await req('GET', '/api/publish-checks', null, rev)).json;
+  const it6 = gate.items.find((x) => x.objectionId === o6);
+  ok(it6 && JSON.stringify(it6.proposalIds) === JSON.stringify([pIns.json.id]),
+    '插入点严格在引用范围内算触及；终点相接的插入点不算触及');
+  await expectFail(req('POST', '/api/publish', {}, rev), 409, '缺少有效回应', '插入点触及未回应阻止发布');
+  await req('POST', `/api/objections/${o6}/respond`, { note: '插入点落在引用范围内，确认回应' }, rev);
+  const pub17 = await req('POST', '/api/publish', { note: '插入点触及' }, rev);
+  ok(pub17.status === 201 && pub17.json.versionId === 17, '回应后发布 v17');
+  const seg5v17 = (await cur(par)).segments.find((s) => s.seg === 5).text;
+  ok(seg5v17.includes('确认【插入】第3段') && seg5v17.includes('【边界】'),
+    'v17 正文：范围内插入生效，边界插入同样生效但未要求回应');
+  const v17 = (await req('GET', '/api/versions/17', null, par)).json;
+  ok(v17.responses.length === 1 && v17.responses[0].objectionId === o6
+    && JSON.stringify(v17.responses[0].proposalIds) === JSON.stringify([pIns.json.id]),
+    'v17 只读回应只关联范围内插入修订');
+
+  // 历史版本回应不随后续操作改变（v11 回应快照保持首次冻结内容与关联）
+  const v11again = (await req('GET', '/api/versions/11', null, par)).json;
+  ok(v11again.responses.length === 1 && v11again.responses[0].note === '复核更新：再次确认，修订保留，异议原文快照留存',
+    '历史版本回应只读，不随后续发布改变');
 
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);

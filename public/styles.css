@@ -220,6 +220,28 @@ body {
 .publish-bar > div:first-child { flex: 1; font-size: 13px; color: var(--primary-dark); }
 .publish-bar input { width: 240px; margin: 0; }
 
+/* 发布前异议回应核对 */
+.gate-warn {
+  margin-top: 8px;
+  background: #fbf0ee;
+  border: 1px solid var(--conflict-border);
+  color: var(--danger);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+}
+.gate-list { margin: 6px 0 0; padding-left: 18px; }
+.gate-list li { margin: 3px 0; }
+.gate-list a { color: var(--danger); font-weight: 700; }
+.gate-ok { margin-top: 8px; color: var(--primary-dark); font-size: 12.5px; }
+.touch-line { margin-top: 6px; font-size: 12.5px; color: var(--muted); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.response-note { margin-top: 6px; }
+.card.needs-response { border-color: var(--conflict-border); background: #fdf6f4; }
+.card.responded { border-color: var(--adopt-border); background: #f7faf0; }
+.card.flash { box-shadow: 0 0 0 3px var(--warn); transition: box-shadow .3s; }
+.related-list { margin-top: 4px; display: flex; flex-direction: column; gap: 6px; }
+.related-item { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; background: #faf9f4; }
+
 /* ---------- 侧栏标签 ---------- */
 .tabs { display: flex; border-bottom: 1px solid var(--line); }
 .tab {

@@ -108,6 +108,10 @@ npm test
 4. **复核员发布**：同一基版上互不重叠的采纳结果按段合并，形成**不可变新版本**；
    暂存区为空时发布会被拒绝（防止重复发布）。发布后所有仍待复核的提议一律标记为“基版已过期”冲突，
    需由记录员基于新版本重新提交（可手工重提，也可用下述“续提”）。可随时切换“发布预览”查看合并效果。
+   - **发布前须逐条回应被暂存修订触及的异议**（见第 8 节）：触及按“段内 Unicode 码点半开区间与异议
+     当前锚点相交”判定，**插入点落在引用范围内也算触及**（边界相接不算）。复核员须为每条受影响异议
+     填写**非空回应说明**（回应自动关联异议、相关采纳提议及当时的版本与暂存状态）；缺失或回应已失效时
+     发布被拒绝，版本、提议及决议均不改变。没有受影响异议时仍按原规则发布。
 5. **续提（基版已过期提议的换算重提）**：记录员可对**本人**因发布被标为“基版已过期”的冲突提议，
    在提议卡片或详情弹窗中点击“续提到当前版本…”发起**续提预览**；非本人或非此类冲突（如范围交叠）的提议会被拒绝。
    - 系统按从原基版到当前版**逐次发布的修订**，把原段内码点半开选区换算到当前正文，
@@ -123,6 +127,29 @@ npm test
      **“待重新定位”**警示，原文快照继续保留；可由提出者或复核员在当前版本上手动重新定位并留痕。
 7. **版本查看**：“版本”面板可只读查看任一历史版本的**正文、决议（采纳/驳回/冲突/续提/发布留痕）与异议**；
    历史版本内容不随后续发布改变。
+8. **发布前异议回应（本轮新增）**：复核员发布暂存修订前，系统按异议**当前锚点**逐条核对受影响集合。
+   - **触及判定**：暂存修订的段内码点半开区间 `[start,end)` 与异议当前锚点 `[aStart,aEnd)` 同段且
+     `start < aEnd && aStart < end` 即为触及；零长度修订（纯插入）的**插入点严格落在引用范围内也算触及**，
+     `[0,2)` 与 `[2,4)` 这种边界相接不算。待重新定位的异议也按其当前锚点参与判定。
+   - **填写回应**（`POST /api/objections/:id/respond`，仅复核员）：`note` 必填非空。回应自动关联该异议、
+     本次触及它的**相关采纳提议**集合，并快照回应时的**版本**与**暂存状态指纹**、异议锚点；同一发布周期内
+     可反复覆盖更新。
+   - **发布时重新核对**：采纳/驳回提议（相关提议集合或暂存状态变化）、重新定位异议（锚点变化）或有新异议
+     被触及后，发布事务内会重新计算受影响集合并逐条校验回应绑定：缺失回应（`MISSING_RESPONSE`）、
+     回应后暂存区变化（`STAGE_CHANGED`）、相关提议集合变化（`PROPOSALS_CHANGED`）、异议被重新定位
+     （`OBJECTION_RELOCATED`）、说明为空（`EMPTY_NOTE`）一律**拒绝发布**（409
+     `OBJECTION_RESPONSES_REQUIRED`，响应体 `details` 逐条列出失效原因），事务回滚——
+     版本、提议及决议均不改变，已采纳修订仍留在暂存区，重新核对并回应后即可再发。
+   - 异议已不再被任何暂存修订触及（如唯一相关修订被驳回）时，原草稿成为**失效孤儿**：网页与
+     `GET /api/publish-checks` 会展示其失效原因，它**不阻止发布**；成功发布后孤儿草稿自动丢弃，不写入历史。
+   - **没有受影响异议时仍可按原规则发布**（含暂存区为空时的重复发布防护不变）。
+   - **成功发布后**：每条受影响异议的有效回应随新版本**冻结只读**，在对应历史版本
+     （`GET /api/versions/:id` 的 `responses` 与版本查看弹窗“发布前异议回应”区）展示；
+     异议**原文快照保留**、既有“相交即待重新定位”的规则不变。
+
+网页中：发布条会列出待回应项与失效原因（可点击跳到异议卡片），未齐备时“发布新版本”按钮禁用；
+“异议”页签对被触及异议显示“发布前待回应 / 已回应·待发布 / 回应已失效”状态与回应入口（仅复核员），
+页签角标计入待处理数；历史版本查看器新增“发布前异议回应”只读区。
 
 所有失败场景（无权操作、非法字符范围、重复发布、重复导入、重复采纳/重定位等）均返回明确的
 HTTP 状态码与中文原因，且在数据库事务中执行——失败即回滚，不改变任何状态。
@@ -152,7 +179,10 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `POST /api/publish` | 复核员 | 合并暂存修订并发布新版本 |
 | `POST /api/objections` | 登录用户 | 对原文范围提出异议 `{seg,start,end,note}` |
 | `POST /api/objections/:id/relocate` | 提出者或复核员 | 对“待重新定位”的异议手动重定位 |
-| `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议） |
+| `POST /api/objections/:id/respond` | 复核员 | 发布前对被暂存修订触及的异议填写/更新非空回应 `{note}`；未被触及返回 409 |
+| `GET /api/publish-checks` | 复核员 | 发布前核对（只读）：受影响异议、待回应项、逐条失效原因（`blockers`）、失效孤儿草稿与 `canPublish`。`GET /api/booth` 的 `publishChecks` 字段返回同一结构 |
+| `POST /api/publish` | 复核员 | 合并暂存修订并发布；存在缺失/失效异议回应时 409 `OBJECTION_RESPONSES_REQUIRED`（`details` 逐条说明），事务回滚 |
+| `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议/`responses` 发布前异议回应） |
 
 ---
 
@@ -166,6 +196,54 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 - `decisions`：决议审计流（adopt / reject / conflict / rebase / publish），不可变追加。
 - `objections` + `objection_anchors`：异议主表（含永久原文快照）与逐版本锚点；
   发布时按修订映射，相交即置 `needs_relocation`。`objection_logs` 记录创建与重定位操作。
+- `objection_responses`：发布前异议回应。`status='pending'` 为发布周期内草稿（每异议每版本至多一条，
+  部分唯一索引），保存非空说明 `note`、相关采纳提议快照 `proposal_ids_json`、回应时版本
+  `base_version_id`、暂存状态指纹 `stage_fingerprint` 与锚点快照；发布重新核对通过后随新版本置
+  `frozen` 并记录 `published_version_id`，在该历史版本只读展示；已不触及异议的孤儿草稿在成功发布时删除。
+
+---
+
+## 六之二、发布前异议回应：HTTP 调用示例
+
+```bash
+# 1) 复核员登录（Cookie 自动保存在 cookies.txt）
+curl -c cookies.txt -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"reviewer","password":"reviewer123"}'
+
+# 2) 发布前核对：查看受影响异议、待回应项与失效原因
+curl -b cookies.txt http://localhost:3000/api/publish-checks
+# 未齐备时示例：
+# { "versionId":3, "affectedCount":1, "canPublish":false,
+#   "blockers":[ {"objectionId":1,"responseId":null,
+#                 "reasonCode":"MISSING_RESPONSE",
+#                 "reason":"该异议被本次暂存修订触及，尚未填写回应，发布被阻止"} ],
+#   "items":[ ... ], "orphanResponses":[] }
+# reasonCode 取值：MISSING_RESPONSE / STAGE_CHANGED / PROPOSALS_CHANGED /
+#                  OBJECTION_RELOCATED / EMPTY_NOTE / NOT_TOUCHED_ANYMORE
+
+# 3) 对被触及的异议逐条填写非空回应（也可在 /api/booth 的 publishChecks.items 中取 objectionId）
+curl -b cookies.txt -X POST http://localhost:3000/api/objections/1/respond \
+  -H 'Content-Type: application/json' \
+  -d '{"note":"经复核录音00:34:10，修订与原声一致；异议原文快照留存，继续跟踪。"}'
+# 201 新建 / 200 覆盖更新 {"ok":true,"id":1,"updated":false}
+
+# 4) 回应缺失或失效时发布会被拒绝（事务回滚，版本/提议/决议不变；details 逐条说明）
+curl -b cookies.txt -X POST http://localhost:3000/api/publish \
+  -H 'Content-Type: application/json' -d '{"note":"第二次修订"}'
+# HTTP/1.1 409
+# {"error":"发布被拒绝：有 1 项……缺少有效回应……",
+#  "code":"OBJECTION_RESPONSES_REQUIRED",
+#  "details":[{"objectionId":1,"responseId":null,"reasonCode":"MISSING_RESPONSE","reason":"……"}]}
+
+# 5) 全部受影响异议均有有效回应后发布成功；历史版本只读查看冻结回应
+curl -b cookies.txt -X POST http://localhost:3000/api/publish \
+  -H 'Content-Type: application/json' -d '{"note":"第二次修订"}'
+# {"ok":true,"versionId":3}
+curl -b cookies.txt http://localhost:3000/api/versions/3
+# responses: [{ id, objectionId, proposalIds:[7], baseVersionId:2, seg, start, end,
+#              note, responder_name, created_at }]
+```
 
 ---
 

@@ -106,6 +106,17 @@ app.post('/api/objections/:id/relocate', requireAuth, wrap((req, res) => {
   res.json({ ok: true });
 }));
 
+// 发布前回应（复核员）：保存对某条“被暂存修订触及”异议的非空回应，关联相关采纳提议
+app.post('/api/objections/:id/respond', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.saveObjectionResponse(db, req.user, parseInt(req.params.id, 10), req.body || {});
+  res.status(result.updated ? 200 : 201).json({ ok: true, ...result });
+}));
+
+// ---------- 发布核对（只读）：待回应项、失效原因与是否可发布 ----------
+app.get('/api/publish-checks', requireRole('reviewer'), wrap((_req, res) => {
+  res.json(store.publishChecks(db));
+}));
+
 // ---------- 不可变版本视图 ----------
 app.get('/api/versions/:id', requireAuth, wrap((req, res) => {
   res.json(store.versionView(db, parseInt(req.params.id, 10)));
@@ -118,10 +129,13 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use((err, _req, res, _next) => {
   const status = err.status || 500;
   if (status >= 500) console.error('[error]', err);
-  res.status(status).json({
+  const payload = {
     error: err.message || '服务器内部错误',
     code: err.code || (status === 500 ? 'INTERNAL' : 'ERROR'),
-  });
+  };
+  // 发布核对失败等场景附带逐条明细（待回应项 / 失效原因）
+  if (err.details) payload.details = err.details;
+  res.status(status).json(payload);
 });
 
 app.listen(PORT, HOST, () => {

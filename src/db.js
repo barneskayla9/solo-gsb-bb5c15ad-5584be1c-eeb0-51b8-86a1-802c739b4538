@@ -131,9 +131,32 @@ function initSchema(db) {
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- 发布前对“被暂存修订触及的异议”的回应：pending=发布周期内的草稿（可反复覆盖），
+  -- frozen=随某次成功发布冻结，仅在对应历史版本只读展示。
+  CREATE TABLE IF NOT EXISTS objection_responses (
+    id            INTEGER PRIMARY KEY,
+    objection_id  INTEGER NOT NULL REFERENCES objections(id),
+    proposal_ids_json TEXT NOT NULL DEFAULT '[]', -- 回应时关联的相关采纳提议（暂存快照）
+    base_version_id   INTEGER NOT NULL REFERENCES versions(id), -- 回应时的版本（发布周期）
+    stage_fingerprint TEXT NOT NULL DEFAULT '',   -- 回应时的暂存状态指纹
+    anchor_seg    INTEGER NOT NULL,               -- 回应时异议当前锚点快照
+    anchor_start_cp INTEGER NOT NULL,
+    anchor_end_cp   INTEGER NOT NULL,
+    note          TEXT NOT NULL,                  -- 非空回应说明
+    status        TEXT NOT NULL CHECK (status IN ('pending','frozen')),
+    published_version_id INTEGER REFERENCES versions(id), -- 冻结后所在新版本
+    created_by    INTEGER NOT NULL REFERENCES users(id),
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_proposals_base ON proposals(base_version_id, status);
   CREATE INDEX IF NOT EXISTS idx_decisions_version ON decisions(version_id);
   CREATE INDEX IF NOT EXISTS idx_anchors_version ON objection_anchors(version_id);
+  -- 同一发布周期内，每条异议至多一份待发布回应草稿（冻结后的历史行不受限制）
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_responses_pending
+    ON objection_responses(objection_id, base_version_id) WHERE status = 'pending';
+  CREATE INDEX IF NOT EXISTS idx_responses_published ON objection_responses(published_version_id);
   `);
 
   // 既有数据库的轻量迁移：补充续提所需列，并按冲突原因文本回填类别

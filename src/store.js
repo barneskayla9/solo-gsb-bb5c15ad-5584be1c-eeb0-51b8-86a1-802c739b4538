@@ -238,6 +238,180 @@ function previewSegments(segments, stage) {
   });
 }
 
+// ---------- 发布前异议回应 ----------
+// 半开区间触及判定：暂存修订 [e.start,e.end) 与异议当前锚点 [a.start,a.end) 在同一段相交；
+// 修订插入点落在引用范围内（e.start < a.end 且 a.start < e.end）也算触及，
+// 边界相接（[0,2) 与 [2,4)）不算。
+function touches(edit, anchor) {
+  return edit.seg === anchor.seg && edit.start < anchor.end && anchor.start < edit.end;
+}
+
+// 某版本下全部异议的当前锚点（异议视图与发布核对共用；历史锚点亦由此读取）
+function anchorsAt(db, versionId) {
+  return db
+    .prepare(
+      `SELECT a.objection_id AS id, a.seg, a.start_cp AS start, a.end_cp AS end, a.status
+       FROM objection_anchors a WHERE a.version_id = ? ORDER BY a.objection_id`
+    )
+    .all(versionId);
+}
+
+// 计算当前发布周期被暂存修订触及的异议锚点，并附带触及它的相关采纳提议
+function touchedObjections(db, cur, stage) {
+  const anchors = anchorsAt(db, cur.id);
+  const edits = stage.map((p) => ({
+    proposalId: p.id, seg: p.seg, start: p.start_cp, end: p.end_cp, replacement: p.replacement,
+  }));
+  return anchors
+    .map((a) => {
+      const by = edits.filter((e) => touches(e, a));
+      return by.length ? { ...a, proposals: by } : null;
+    })
+    .filter(Boolean);
+}
+
+// 复核员保存（或覆盖）某条被触及异议的回应草稿；草稿关联相关采纳提议、
+// 当时的版本与暂存状态指纹及锚点快照。
+function saveObjectionResponse(db, actor, id, body) {
+  const o = db.prepare('SELECT * FROM objections WHERE id=?').get(id);
+  if (!o) throw notFound(`异议 #${id} 不存在`);
+  const note = typeof (body && body.note) === 'string' ? body.note.trim() : '';
+  if (!note) throw badRequest('回应说明不能为空：发布前须逐条填写非空说明');
+  const cur = latestVersion(db);
+  const stage = stageProposals(db, cur.id);
+  const anchor = anchorsAt(db, cur.id).find((a) => a.id === id);
+  if (!anchor) throw conflict(`异议 #${id} 在当前版本 v${cur.id} 中没有锚点，无法回应`, 'NO_ANCHOR');
+  const edits = stage.map((p) => ({
+    proposalId: p.id, seg: p.seg, start: p.start_cp, end: p.end_cp,
+  }));
+  const by = edits.filter((e) => touches(e, anchor));
+  if (!by.length) {
+    throw conflict(
+      `异议 #${id} 未被当前暂存修订触及：无需回应，也不能提前填写；待采纳的修订与该引用范围相交后再回应`,
+      'NOT_TOUCHED'
+    );
+  }
+  const fp = stageFingerprint(stage);
+  const proposalIds = by.map((e) => e.proposalId).sort((x, y) => x - y);
+  return db.transaction(() => {
+    const existing = db
+      .prepare(`SELECT id FROM objection_responses WHERE objection_id=? AND base_version_id=? AND status='pending'`)
+      .get(id, cur.id);
+    if (existing) {
+      db.prepare(
+        `UPDATE objection_responses
+         SET proposal_ids_json=?, stage_fingerprint=?, anchor_seg=?, anchor_start_cp=?, anchor_end_cp=?,
+             note=?, created_by=?, updated_at=datetime('now')
+         WHERE id=?`
+      ).run(JSON.stringify(proposalIds), fp, anchor.seg, anchor.start, anchor.end, note, actor.id, existing.id);
+      return { id: existing.id, updated: true };
+    }
+    const r = db.prepare(
+      `INSERT INTO objection_responses
+        (objection_id, proposal_ids_json, base_version_id, stage_fingerprint,
+         anchor_seg, anchor_start_cp, anchor_end_cp, note, status, created_by)
+       VALUES (?,?,?,?,?,?,?,?,'pending',?)`
+    ).run(id, JSON.stringify(proposalIds), cur.id, fp, anchor.seg, anchor.start, anchor.end, note, actor.id);
+    return { id: r.lastInsertRowid, updated: false };
+  })();
+}
+
+// 逐条核对一份回应草稿与发布瞬间的实际状态，返回 {valid, reasonCode, reason}。
+// 采纳或驳回提议、重新定位或新建异议之后，受影响集合与回应绑定都要重新核对。
+function evaluateResponse(db, r, cur, stage, touchedMap, fp) {
+  if (r.base_version_id !== cur.id || r.stage_fingerprint !== fp) {
+    return {
+      valid: false, reasonCode: 'STAGE_CHANGED',
+      reason: `回应保存后暂存修订已变化（原关联提议 ${r.proposal_ids_json}），该回应已失效，请按当前暂存区重新核对并回应`,
+    };
+  }
+  const t = touchedMap.get(r.objection_id);
+  if (!t) {
+    return {
+      valid: false, reasonCode: 'NOT_TOUCHED_ANYMORE',
+      reason: '异议当前已不被任何暂存修订触及（例如相关修订已被驳回），原回应失效并将被丢弃；无需回应',
+    };
+  }
+  const want = t.proposals.map((e) => e.proposalId).sort((x, y) => x - y);
+  const got = JSON.parse(r.proposal_ids_json || '[]').sort((x, y) => x - y);
+  if (want.length !== got.length || want.some((v, i) => v !== got[i])) {
+    return {
+      valid: false, reasonCode: 'PROPOSALS_CHANGED',
+      reason: `回应关联的相关采纳提议已变化（回应时 [${got.join(',')}]，当前 [${want.join(',')}]），请重新回应`,
+    };
+  }
+  if (r.anchor_seg !== t.seg || r.anchor_start_cp !== t.start || r.anchor_end_cp !== t.end) {
+    return {
+      valid: false, reasonCode: 'OBJECTION_RELOCATED',
+      reason: `回应后异议 #${r.objection_id} 已被重新定位（锚点由第 ${r.anchor_seg} 段 [${r.anchor_start_cp},${r.anchor_end_cp}) 变为第 ${t.seg} 段 [${t.start},${t.end})），请重新回应`,
+    };
+  }
+  if (!(r.note || '').trim()) {
+    return { valid: false, reasonCode: 'EMPTY_NOTE', reason: '回应说明为空，须填写非空说明' };
+  }
+  return { valid: true };
+}
+
+// 发布核对：返回受影响集合、逐项待回应/失效信息及是否阻止发布。
+// 纯读取；发布事务内会用同一逻辑再次核对（先核对后落版）。
+function publishChecks(db) {
+  const cur = latestVersion(db);
+  if (!cur || !getDoc(db)) {
+    return { initialized: false, canPublish: false, blockers: [], items: [] };
+  }
+  const stage = stageProposals(db, cur.id);
+  const fp = stageFingerprint(stage);
+  const touched = touchedObjections(db, cur, stage);
+  const touchedMap = new Map(touched.map((t) => [t.id, t]));
+  const drafts = db
+    .prepare(`SELECT * FROM objection_responses WHERE status='pending' AND base_version_id=? ORDER BY objection_id`)
+    .all(cur.id);
+  const draftMap = new Map(drafts.map((r) => [r.objection_id, r]));
+  const items = [];
+  for (const t of touched) {
+    const r = draftMap.get(t.id);
+    if (!r) {
+      items.push({
+        objectionId: t.id, seg: t.seg, start: t.start, end: t.end,
+        anchorStatus: t.status, proposalIds: t.proposals.map((e) => e.proposalId),
+        valid: false, missing: true, reasonCode: 'MISSING_RESPONSE',
+        reason: '该异议被本次暂存修订触及，尚未填写回应，发布被阻止',
+      });
+    } else {
+      const ev = evaluateResponse(db, r, cur, stage, touchedMap, fp);
+      items.push({
+        responseId: r.id, objectionId: t.id, seg: t.seg, start: t.start, end: t.end,
+        anchorStatus: t.status, proposalIds: t.proposals.map((e) => e.proposalId),
+        note: r.note, updatedAt: r.updated_at,
+        valid: ev.valid, missing: false, reasonCode: ev.valid ? null : ev.reasonCode,
+        reason: ev.valid ? '' : ev.reason,
+      });
+    }
+  }
+  // 草稿仍在、但其异议已不在当前受影响集合：失效项（不阻止发布，发布时丢弃）
+  const orphans = drafts
+    .filter((r) => !touchedMap.has(r.objection_id))
+    .map((r) => ({
+      responseId: r.id, objectionId: r.objection_id, note: r.note, updatedAt: r.updated_at,
+      valid: false, orphan: true, reasonCode: 'NOT_TOUCHED_ANYMORE',
+      reason: '异议当前已不被任何暂存修订触及，该回应草稿失效，成功发布后将自动丢弃',
+    }));
+  const blockers = items.filter((it) => !it.valid);
+  return {
+    initialized: true,
+    versionId: cur.id,
+    stageFingerprint: fp,
+    affectedCount: touched.length,
+    canPublish: blockers.length === 0,
+    blockers: blockers.map((b) => ({
+      objectionId: b.objectionId, responseId: b.responseId || null,
+      reasonCode: b.reasonCode, reason: b.reason,
+    })),
+    items,
+    orphanResponses: orphans,
+  };
+}
+
 // ---------- 发布 ----------
 function publish(db, actor, note) {
   const cur = latestVersion(db);
@@ -249,6 +423,37 @@ function publish(db, actor, note) {
   const segments = segmentsOf(cur);
 
   return db.transaction(() => {
+    // 0) 发布核对：受影响异议必须逐条绑定有效回应；失效或缺失回应则拒绝发布，
+    //    事务内抛出即回滚——版本、提议及决议均不改变。
+    const fp = stageFingerprint(stage);
+    const touched = touchedObjections(db, cur, stage);
+    const touchedMap = new Map(touched.map((t) => [t.id, t]));
+    const drafts = db
+      .prepare(`SELECT * FROM objection_responses WHERE status='pending' AND base_version_id=?`)
+      .all(cur.id);
+    const draftMap = new Map(drafts.map((r) => [r.objection_id, r]));
+    const blockers = [];
+    for (const t of touched) {
+      const r = draftMap.get(t.id);
+      if (!r) {
+        blockers.push({
+          objectionId: t.id, responseId: null, reasonCode: 'MISSING_RESPONSE',
+          reason: `异议 #${t.id} 被本次暂存修订触及（第 ${t.seg} 段 [${t.start},${t.end})），但尚未回应；发布前须逐条回应`,
+        });
+        continue;
+      }
+      const ev = evaluateResponse(db, r, cur, stage, touchedMap, fp);
+      if (!ev.valid) blockers.push({ objectionId: t.id, responseId: r.id, reasonCode: ev.reasonCode, reason: ev.reason });
+    }
+    if (blockers.length) {
+      throw Object.assign(
+        new Error(
+          `发布被拒绝：有 ${blockers.length} 项被暂存修订触及的异议缺少有效回应（或回应已失效），版本、提议及决议均未改变`
+        ),
+        { status: 409, code: 'OBJECTION_RESPONSES_REQUIRED', details: blockers }
+      );
+    }
+
     // 1) 合版：同一基版上互不重叠的采纳结果按段合并
     const newSegments = previewSegments(segments, stage);
 
@@ -284,6 +489,16 @@ function publish(db, actor, note) {
 
     // 4) 异议锚点映射：相交即需重新定位，保留原文快照
     mapObjectionAnchors(db, newId, stage);
+
+    // 4.5) 回应落版：受影响异议的有效回应随新版本冻结（只读展示，保留异议原文快照与既有重定位规则）；
+    //      其余草稿（异议已不再被触及）在本周期结束后丢弃。
+    const freeze = db.prepare(
+      `UPDATE objection_responses
+       SET status='frozen', published_version_id=?, updated_at=datetime('now')
+       WHERE status='pending' AND base_version_id=? AND objection_id=?`
+    );
+    for (const t of touched) freeze.run(newId, cur.id, t.id);
+    db.prepare(`DELETE FROM objection_responses WHERE status='pending' AND base_version_id=?`).run(cur.id);
 
     // 5) 决议水位线：包含本次发布产生的全部决议
     const watermark = db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM decisions').get().m;
@@ -651,6 +866,7 @@ function boothView(db) {
     previewSegments: previewSegments(segments, stage),
     proposals: listProposals(db),
     objections: listObjections(db),
+    publishChecks: publishChecks(db),
     versions: db
       .prepare(
         `SELECT v.id, v.note, v.created_at, u.display_name AS creator_name
@@ -689,6 +905,25 @@ function versionView(db, id) {
        ORDER BY a.objection_id`
     )
     .all(v.id);
+  // 随本版本冻结的异议回应（只读）：关联异议、相关采纳提议、回应时的版本/暂存状态与回应说明
+  const responses = db
+    .prepare(
+      `SELECT r.id, r.objection_id AS objectionId, r.proposal_ids_json AS proposalIdsJson,
+              r.base_version_id AS baseVersionId, r.anchor_seg AS seg,
+              r.anchor_start_cp AS start, r.anchor_end_cp AS end,
+              r.note, r.created_at,
+              ru.display_name AS responder_name, ru.username AS responder_user
+       FROM objection_responses r
+       JOIN users ru ON ru.id = r.created_by
+       WHERE r.status='frozen' AND r.published_version_id=?
+       ORDER BY r.id`
+    )
+    .all(v.id)
+    .map((r) => ({
+      ...r,
+      proposalIds: JSON.parse(r.proposalIdsJson || '[]'),
+      proposalIdsJson: undefined,
+    }));
   return {
     id: v.id,
     note: v.note,
@@ -697,6 +932,7 @@ function versionView(db, id) {
     segments: segmentsOf(v),
     decisions,
     objections,
+    responses,
   };
 }
 
@@ -709,6 +945,8 @@ module.exports = {
   publish,
   createObjection,
   relocateObjection,
+  saveObjectionResponse,
+  publishChecks,
   rebasePreview,
   confirmRebase,
   boothView,
