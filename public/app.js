@@ -527,6 +527,8 @@ function openObjectionModal(id) {
   const o = booth.objections.find((x) => x.id === id);
   if (!o) return;
   const canRelocate = o.anchor_status === 'needs_relocation' && (me.role === 'reviewer' || o.creator_user === me.username);
+  const gate = (booth.publishCheck && booth.publishCheck.items || []).find((x) => x.objectionId === id);
+  const canRespond = me.role === 'reviewer' && gate && !gate.satisfied;
   openModal(`
     <h3>异议 #${o.id} <span class="tag tag-${o.anchor_status === 'needs_relocation' ? 'needs_relocation' : 'pending'}">${STATUS_LABEL[o.anchor_status === 'needs_relocation' ? 'needs_relocation' : 'active']}</span></h3>
     <div class="card-meta">
@@ -536,6 +538,10 @@ function openObjectionModal(id) {
     <label>被引原文快照（始终保留，不随后续修订改变）</label>
     <div class="quote">${esc(o.quoted_text)}</div>
     <div class="basis" style="margin-top:6px"><b>说明：</b>${esc(o.note)}</div>
+    ${gate ? (gate.satisfied
+      ? `<div class="snapshot-note gate-ok-note">✔ 已对本次暂存修订（触及提议 ${gate.proposalIds.map((x) => `#${x}`).join('、')}）作出回应（回应 #${gate.response.id}，v${gate.response.versionId}）。</div>`
+      : `<div class="snapshot-note">⚠ 本异议被暂存修订触及（提议 ${gate.proposalIds.map((x) => `#${x}`).join('、')}），发布前须由复核员逐条回应。${
+        gate.response ? `<br/>上一份回应已失效：${esc(gate.response.invalidReason)}` : '当前尚无回应。'}</div>`) : ''}
     ${o.anchor_status === 'needs_relocation' ? `
       <div class="snapshot-note">
         ⚠ 后续修订可能已使被引文字不再存在。系统仅保留原文快照，<b>不会</b>将引用悄悄指向新文字；
@@ -543,10 +549,13 @@ function openObjectionModal(id) {
       </div>` : ''}
     <div class="actions">
       <button class="btn" data-close>关闭</button>
+      ${canRespond ? `<button class="btn primary" id="o-respond">${gate.response ? '重新回应…' : '发布前回应…'}</button>` : ''}
       ${canRelocate ? '<button class="btn primary" id="o-relocate">重新定位…</button>' : ''}
     </div>`);
   const btn = $('#o-relocate');
   if (btn) btn.addEventListener('click', () => openRelocateForm(o));
+  const rb = $('#o-respond');
+  if (rb) rb.addEventListener('click', () => openRespondForm(id));
 }
 
 function openRelocateForm(o) {
@@ -611,8 +620,9 @@ function renderTabs() {
   if (booth && booth.initialized) {
     const pending = booth.proposals.filter((p) => p.status === 'pending' && p.base_ver === booth.currentVersion.id).length;
     const relo = booth.objections.filter((o) => o.anchor_status === 'needs_relocation').length;
+    const respondPending = (booth.publishCheck && booth.publishCheck.items || []).filter((x) => !x.satisfied).length;
     setBadge('badge-proposals', pending);
-    setBadge('badge-objections', relo);
+    setBadge('badge-objections', relo + respondPending);
   } else {
     setBadge('badge-proposals', 0);
     setBadge('badge-objections', 0);
@@ -701,7 +711,19 @@ function renderObjections() {
     panel.innerHTML = '<div class="empty">还没有异议引用。<br/>任何登录用户都可在正文中选择文字范围提出异议。</div>';
     return;
   }
-  panel.innerHTML = booth.objections.map((o) => `
+  panel.innerHTML = booth.objections.map((o) => {
+    const gate = (booth.publishCheck && booth.publishCheck.items || []).find((x) => x.objectionId === o.id);
+    let gateHtml = '';
+    if (gate) {
+      if (gate.satisfied) {
+        gateHtml = `<div class="snapshot-note gate-ok-note">✔ 已对本次暂存修订回应（回应 #${gate.response.id}，v${gate.response.versionId}）。</div>`;
+      } else {
+        const why = !gate.response ? '尚无回应' : `回应已失效：${esc(gate.response.invalidReason)}`;
+        gateHtml = `<div class="snapshot-note">⚠ 被暂存修订触及（提议 ${gate.proposalIds.map((x) => `#${x}`).join('、')}），发布前须回应：${why}
+          ${me.role === 'reviewer' ? `<div class="card-actions"><button class="btn small primary" data-respond="${o.id}">${gate.response ? '重新回应' : '填写回应'}</button></div>` : ''}</div>`;
+      }
+    }
+    return `
     <div class="card">
       <div class="card-head">
         <span class="card-id">#${o.id}
@@ -717,7 +739,11 @@ function renderObjections() {
       <div class="basis"><b>异议：</b>${esc(o.note)}</div>
       ${o.anchor_status === 'needs_relocation' ? `
         <div class="snapshot-note">⚠ 修订后被引文字可能已不存在；此为原文快照，引用未自动指向新文字，请重新定位。</div>` : ''}
-    </div>`).join('');
+      ${gateHtml}
+    </div>`;
+  }).join('');
+  $$('#panel-objections [data-respond]').forEach((b) =>
+    b.addEventListener('click', () => openRespondForm(parseInt(b.dataset.respond, 10))));
 }
 
 // ---------- 侧栏：版本 ----------
@@ -776,11 +802,25 @@ async function openVersion(id) {
             <div class="basis">${esc(o.note)}</div>
             <div class="card-meta">${esc(o.creator_name)} · 提出于 v${o.created_in_version} · ${o.created_at} UTC</div>
           </div>`).join('') : '<p class="muted">本版本尚无异议。</p>'}
+      </div>
+      <div class="v-section">
+        <h4>发布前异议回应（${v.responses.length}）</h4>
+        ${v.responses.length ? v.responses.map((r) => `
+          <div class="decision-item t-adopt">
+            <b>对异议 #${r.objection_id} 的回应</b> · 第 ${r.seg} 段 [${r.start_cp},${r.end_cp})
+            · 关联采纳提议 ${(r.proposalIds || []).length ? r.proposalIds.map((x) => `#${x}`).join('、') : '（无）'}
+            <div class="basis">${esc(r.note)}</div>
+            <div class="card-meta">${esc(r.responder_name)}（${esc(r.responder_user)}）· 回应于 v${r.version_id} · ${r.created_at} UTC · 随 v${r.published_version_id} 发布（只读归档）</div>
+          </div>`).join('') : '<p class="muted">本版本无发布前异议回应（发布未触及异议，或按原规则发布）。</p>'}
       </div>`, true);
   } catch (err) { toast(err.message, 'error'); }
 }
 
 // ---------- 发布 ----------
+function gateItems() {
+  return (booth && booth.publishCheck && booth.publishCheck.items) || [];
+}
+
 function renderPublishBar() {
   const bar = $('#publish-bar');
   if (me.role !== 'reviewer' || !booth.stage.length) {
@@ -796,6 +836,74 @@ function renderPublishBar() {
     `暂存区：<b>${booth.stage.length}</b> 项已采纳修订（` +
     Object.entries(segDesc).map(([s, n]) => `第${s}段×${n}`).join('、') +
     `）。互不重叠的修订将合并发布为 v${booth.currentVersion.id + 1}`;
+
+  // 发布前回应门槛
+  const items = gateItems();
+  const pending = items.filter((it) => !it.satisfied);
+  const gate = $('#publish-gate');
+  if (!items.length) {
+    gate.innerHTML = '<div class="gate-ok">本批暂存修订未触及任何异议，可按原规则发布。</div>';
+  } else if (!pending.length) {
+    gate.innerHTML = `<div class="gate-ok">✔ 被暂存修订触及的 ${items.length} 条异议均已逐条回应，可发布。</div>`;
+  } else {
+    gate.innerHTML =
+      `<div class="gate-warn">⚠ 发布前须逐条回应被暂存修订触及的 ${items.length} 条异议；` +
+      `尚有 <b>${pending.length}</b> 条待回应（或回应已失效），发布将被拒绝：</div>` +
+      `<div class="gate-list">${pending.map((it) => {
+        const why = !it.response
+          ? '尚无回应'
+          : `回应已失效：${esc(it.response.invalidReason)}`;
+        const relo = it.anchorStatus === 'needs_relocation' ? '（异议待重新定位）' : '';
+        return `<div class="gate-item">
+          <div>异议 #${it.objectionId}${relo} · 第 ${it.seg} 段 [${it.start},${it.end}) · 触及提议 ${
+            it.proposalIds.map((x) => `#${x}`).join('、')}</div>
+          <div class="gate-quote">“${esc(it.quotedText)}”</div>
+          <div class="gate-why">${esc(why)}</div>
+          <button class="btn small primary" data-respond="${it.objectionId}">${it.response ? '重新回应' : '填写回应'}</button>
+        </div>`;
+      }).join('')}</div>`;
+    $$('#publish-gate [data-respond]').forEach((b) =>
+      b.addEventListener('click', () => openRespondForm(parseInt(b.dataset.respond, 10))));
+  }
+  $('#publish-btn').disabled = pending.length > 0;
+  $('#publish-btn').textContent = pending.length > 0
+    ? `发布新版本（${pending.length} 条异议待回应）` : '发布新版本';
+}
+
+function openRespondForm(objectionId) {
+  const it = gateItems().find((x) => x.objectionId === objectionId);
+  if (!it) return;
+  const oldNote = it.response && it.response.note ? it.response.note : '';
+  openModal(`
+    <h3>发布前回应异议 #${objectionId}</h3>
+    <p class="muted">回应将关联本异议、触及它的已采纳提议（${it.proposalIds.map((x) => `#${x}`).join('、')}），
+      以及当前版本 v${booth.currentVersion.id} 与暂存状态；采纳/驳回提议、重新定位异议后须重新核对，失效回应不能发布。</p>
+    <div class="card-meta">第 ${it.seg} 段 · 当前锚点 [${it.start}, ${it.end})${
+      it.anchorStatus === 'needs_relocation' ? ' · <span class="tag tag-needs_relocation">待重新定位</span>' : ''}
+      · 提出于 v${it.createdInVersion}</div>
+    <label>被引原文快照（始终保留）</label>
+    <div class="sel-quote">${esc(it.quotedText)}</div>
+    <div class="basis"><b>异议说明：</b>${esc(it.note)}</div>
+    ${it.response && it.response.invalidReason
+      ? `<div class="conflict-reason">上一份回应（#${it.response.id}）已失效：${esc(it.response.invalidReason)}</div>` : ''}
+    <label>回应说明 <em style="color:var(--danger)">*</em>
+      <textarea id="f-respond" rows="4" placeholder="如：经核对录音，该修订不影响异议所指事实，异议留待下一版处理；或：异议成立，暂缓发布本修订……">${esc(oldNote)}</textarea>
+    </label>
+    <div class="actions">
+      <button class="btn" data-close>取消</button>
+      <button class="btn primary" id="f-respond-submit">保存回应</button>
+    </div>`);
+  $('#f-respond-submit').addEventListener('click', async () => {
+    try {
+      const r = await api(`/api/objections/${objectionId}/respond`, {
+        method: 'POST',
+        body: { note: $('#f-respond').value },
+      });
+      closeModal();
+      await reload();
+      toast(`异议 #${objectionId} 的回应 #${r.id} 已保存（关联 v${r.versionId} 暂存状态）`, 'success');
+    } catch (err) { toast(err.message, 'error'); }
+  });
 }
 
 $('#publish-btn').addEventListener('click', async () => {

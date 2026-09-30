@@ -131,9 +131,28 @@ function initSchema(db) {
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- 发布前对异议的逐条回应：关联异议、触及它的已采纳提议，以及回应时的版本与暂存区指纹；
+  -- published_version_id 为空表示回应尚未随版本发布（可被重述取代：status='superseded'）。
+  CREATE TABLE IF NOT EXISTS objection_responses (
+    id          INTEGER PRIMARY KEY,
+    objection_id INTEGER NOT NULL REFERENCES objections(id),
+    note        TEXT NOT NULL,           -- 非空回应说明
+    proposal_ids_json TEXT NOT NULL DEFAULT '[]', -- 触及该异议的暂存提议 id 快照
+    version_id  INTEGER NOT NULL REFERENCES versions(id),   -- 回应时的当前版本
+    stage_fingerprint TEXT NOT NULL,     -- 回应时暂存区指纹（发布时重新核对）
+    seg         INTEGER NOT NULL,        -- 回应时异议当前锚点快照
+    start_cp    INTEGER NOT NULL,
+    end_cp      INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded')),
+    published_version_id INTEGER REFERENCES versions(id),   -- 随哪个版本发布
+    created_by  INTEGER NOT NULL REFERENCES users(id),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_proposals_base ON proposals(base_version_id, status);
   CREATE INDEX IF NOT EXISTS idx_decisions_version ON decisions(version_id);
   CREATE INDEX IF NOT EXISTS idx_anchors_version ON objection_anchors(version_id);
+  CREATE INDEX IF NOT EXISTS idx_responses_objection ON objection_responses(objection_id, status);
   `);
 
   // 既有数据库的轻量迁移：补充续提所需列，并按冲突原因文本回填类别

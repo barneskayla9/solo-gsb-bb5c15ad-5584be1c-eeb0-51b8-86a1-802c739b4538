@@ -106,6 +106,22 @@ app.post('/api/objections/:id/relocate', requireAuth, wrap((req, res) => {
   res.json({ ok: true });
 }));
 
+// 发布前异议回应（复核员）：非空说明 + 关联异议、采纳提议与当前版本/暂存状态
+app.post('/api/objections/:id/respond', requireRole('reviewer'), wrap((req, res) => {
+  const { note } = req.body || {};
+  const result = store.respondToObjection(db, req.user, parseInt(req.params.id, 10), note);
+  res.status(201).json({ ok: true, ...result });
+}));
+
+// 发布前核对（只读）：待回应异议、关联提议与回应状态/失效原因；与 GET /api/booth 的 publishCheck 相同
+app.get('/api/publish-check', requireAuth, wrap((_req, res) => {
+  const ver = store.latestVersion(db);
+  if (!ver || !store.getDoc(db)) {
+    return res.json({ initialized: false, versionId: null, stageFp: '', items: [] });
+  }
+  res.json({ initialized: true, ...store.publishGate(db, ver) });
+}));
+
 // ---------- 不可变版本视图 ----------
 app.get('/api/versions/:id', requireAuth, wrap((req, res) => {
   res.json(store.versionView(db, parseInt(req.params.id, 10)));

@@ -1,7 +1,7 @@
 'use strict';
 // 纯文本算子单元测试（码点偏移、合版、引用映射、续提换算）
 const assert = require('assert');
-const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase } = require('../src/text');
+const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor } = require('../src/text');
 const { parseTranscript } = require('../src/store');
 
 let n = 0;
@@ -80,5 +80,18 @@ ok(segs[0].seg === 1 && segs[1].seg === 2 && segs[2].seg === 3 && segs[3].seg ==
 
 assert.throws(() => parseTranscript('1. 甲\n1. 乙'), /重复/, '重复段号报错');
 assert.throws(() => parseTranscript('   \n\n'), /空|未解析/, '空稿报错');
+
+// ---------- 发布前回应门槛：暂存修订是否触及异议锚点（editTouchesAnchor） ----------
+// 非零长度修订：半开区间相交即触及，端点相接不算
+ok(editTouchesAnchor({ start: 2, end: 5 }, { start: 5, end: 8 }) === false, '门槛：修订起点等于引用终点（相接）不算触及');
+ok(editTouchesAnchor({ start: 5, end: 7 }, { start: 2, end: 5 }) === false, '门槛：修订终点等于引用起点（相接）不算触及');
+ok(editTouchesAnchor({ start: 3, end: 6 }, { start: 2, end: 5 }) === true, '门槛：区间相交算触及');
+ok(editTouchesAnchor({ start: 0, end: 2 }, { start: 1, end: 3 }) === true, '门槛：部分相交算触及');
+ok(editTouchesAnchor({ start: 3, end: 4 }, { start: 9, end: 12 }) === false, '门槛：完全不相交不算触及');
+// 零长度修订（纯插入）：插入点落在引用范围 [a,b) 内（a ≤ 点 < b）算触及
+ok(editTouchesAnchor({ start: 5, end: 5 }, { start: 2, end: 8 }) === true, '门槛：零长度插入点在引用范围内算触及');
+ok(editTouchesAnchor({ start: 2, end: 2 }, { start: 2, end: 8 }) === true, '门槛：插入点恰在引用起点算触及');
+ok(editTouchesAnchor({ start: 8, end: 8 }, { start: 2, end: 8 }) === false, '门槛：插入点恰在引用终点不算触及');
+ok(editTouchesAnchor({ start: 9, end: 9 }, { start: 2, end: 8 }) === false, '门槛：插入点在引用范围外不算触及');
 
 console.log(`\n单元测试全部通过：${n} 项 ✅`);

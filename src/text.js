@@ -87,4 +87,24 @@ function transformRangeRebase(range, edits) {
   return { start: start + delta, end: end + delta, affected: false };
 }
 
-module.exports = { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase };
+// 发布前回应门槛：暂存修订（edit）是否触及异议当前锚点（anchor）。
+// - 非零长度修订：两个半开区间相交即触及（[0,2) 与 [2,4) 相接不算）；
+// - 零长度修订（纯插入）：插入点落在引用范围 [anchor.start, anchor.end) 内即触及
+//   （点等于引用起点算触及，等于引用终点不算，与半开区间口径一致）。
+function editTouchesAnchor(edit, anchor) {
+  if (edit.start === edit.end) {
+    return anchor.start <= edit.start && edit.start < anchor.end;
+  }
+  return edit.start < anchor.end && anchor.start < edit.end;
+}
+
+module.exports = {
+  codeLength,
+  sliceCP,
+  validateRange,
+  overlaps,
+  applyEdits,
+  transformRange,
+  transformRangeRebase,
+  editTouchesAnchor,
+};
